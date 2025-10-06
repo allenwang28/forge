@@ -317,7 +317,7 @@ async def main(cfg: DictConfig):
     if cfg.get("provisioner", None) is not None:
         await init_provisioner(
             ProvisionerConfig(
-                launcher_config=LauncherConfig(**cfg.provisioner.launcher)
+                launcher_config=LauncherConfig(**cfg.provisioner)
             )
         )
     metric_logging_cfg = cfg.get("metric_logging", {"console": {"log_per_rank": False}})
@@ -464,7 +464,7 @@ async def main(cfg: DictConfig):
                 t.step("update_weights")
 
                 if training_step >= 2:
-                    await drop_weights(training_step - 1)
+                    # await drop_weights(training_step - 1)
                     t.step("drop_weights")
 
                 t.stop()
