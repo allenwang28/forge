@@ -582,7 +582,16 @@ class PolicyWorker(ForgeActor):
     @endpoint
     async def setup(self):
         # TODO: remove ["gpus"] when monarch implements a flat rank
-        self.rank = current_rank()["gpus"]
+        import os
+        self.rank = current_rank().rank
+        os.environ["RANK"] = str(self.rank)
+
+        print(f"===DEBUG=== rank: {os.environ.get('RANK')}")
+        print(f"===DEBUG=== master_addr: {os.environ.get('MASTER_ADDR')}")
+        print(f"===DEBUG=== master_port: {os.environ.get('MASTER_PORT')}")
+        print(f"===DEBUG=== world_size: {os.environ.get('WORLD_SIZE')}")
+        print(f"===DEBUG=== vllm_host_ip: {os.environ.get('VLLM_HOST_IP')}")
+
         self.worker = self.setup_worker()
 
     @endpoint

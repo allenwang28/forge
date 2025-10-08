@@ -153,16 +153,12 @@ async def main(cfg: DictConfig):
         trainer_dp_degree = cfg.trainer.parallelism.get("data_parallel_shard_degree", 1)
         dp_size = trainer_dp_degree if trainer_dp_degree != -1 else 1
 
-    await init_provisioner(
-        ProvisionerConfig(
-            launcher_config=LauncherConfig(
-                launcher=Launcher(cfg.get(LAUNCHER_KEY, Launcher.SLURM.value)),
-                job_name=cfg.get(JOB_NAME_KEY, None),
-                services={k: ServiceConfig(**v) for k, v in cfg.services.items()},
-                actors={k: ProcessConfig(**v) for k, v in cfg.actors.items()},
+    if cfg.get("provisioner", None) is not None:
+        await init_provisioner(
+            ProvisionerConfig(
+                launcher_config=LauncherConfig(**cfg.provisioner)
             )
         )
-    )
 
     metric_logging_cfg = cfg.get("metric_logging", {"console": {"log_per_rank": False}})
     mlogger = await get_or_create_metric_logger()

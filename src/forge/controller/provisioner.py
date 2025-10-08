@@ -54,7 +54,7 @@ async def get_remote_info(host_mesh: HostMesh) -> tuple[str, str]:
     fetcher = fetcher.slice(**singleton_slice)
     # Fetcher should be a singleton at this point - call_one() will fail otherwise
     host, port = await fetcher.get_info.call_one()
-    await throwaway_procs.stop()
+    # await throwaway_procs.stop()
     return host, port
 
 
@@ -225,9 +225,14 @@ class Provisioner:
                 for k, v in env.items():
                     os.environ[k] = v
 
+                os.environ["VLLM_HOST_IP"] = socket.gethostbyname(socket.getfqdn())
+                os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
+                os.environ["GLOO_LOG_LEVEL"] = "TRACE"
+
             if with_gpus:
                 if not addr or not port:
                     addr, port = await get_remote_info(host_mesh)
+                print(f"=====DEBUG====== USING ADDR {addr} AND PORT {port} FOR PTD")
                 gpu_ids = gpu_manager.get_gpus(num_procs)
 
                 env_vars["MASTER_ADDR"] = addr
@@ -235,7 +240,11 @@ class Provisioner:
                 env_vars["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
                 env_vars["HYPERACTOR_MESSAGE_DELIVERY_TIMEOUT_SECS"] = "600"
                 env_vars["HYPERACTOR_CODE_MAX_FRAME_LENGTH"] = "1073741824"
-                env_vars["RUST_BACKTRACE"] = "1"
+                env_vars["RUST_BACKTRACE"] = "full"
+                env_vars["DISABLE_PERF_METRICS"] = "1"
+                env_vars["FORGE_DISABLE_METRICS"] = "1"
+                env_vars["WORLD_SIZE"] = str(num_procs * num_hosts)
+                # env_vars["MONARCH_STDERR_LOG"] = "debug"
 
             procs = host_mesh.spawn_procs(
                 per_host={"gpus": num_procs},

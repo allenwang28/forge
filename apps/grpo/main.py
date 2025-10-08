@@ -464,7 +464,7 @@ async def main(cfg: DictConfig):
                 t.step("update_weights")
 
                 if training_step >= 2:
-                    # await drop_weights(training_step - 1)
+                    await drop_weights(training_step - 1)
                     t.step("drop_weights")
 
                 t.stop()
