@@ -244,7 +244,7 @@ class Provisioner:
                 env_vars["DISABLE_PERF_METRICS"] = "1"
                 env_vars["FORGE_DISABLE_METRICS"] = "1"
                 env_vars["WORLD_SIZE"] = str(num_procs * num_hosts)
-                # env_vars["MONARCH_STDERR_LOG"] = "debug"
+                env_vars["MONARCH_STDERR_LOG"] = "debug"
 
             procs = host_mesh.spawn_procs(
                 per_host={"gpus": num_procs},
