@@ -307,174 +307,176 @@ async def main(cfg: DictConfig):
     metric_logging_cfg = cfg.get("metric_logging", {"console": {"log_per_rank": False}})
     mlogger = await get_or_create_metric_logger()
     await mlogger.init_backends.call_one(metric_logging_cfg)
-
+    shutdown_event = asyncio.Event()
     # ---- Setup services ---- #
 
-    (
-        dataloader,
-        policy,
-        trainer,
-        replay_buffer,
-        compute_advantages,
-        ref_model,
-        reward_actor,
-    ) = await asyncio.gather(
-        DatasetActor.options(**cfg.actors.dataset).as_actor(**cfg.dataset),
-        Policy.options(**cfg.services.policy).as_service(**cfg.policy),
-        RLTrainer.options(**cfg.actors.trainer).as_actor(
-            **cfg.trainer, loss=simple_grpo_loss
-        ),
-        ReplayBuffer.options(**cfg.actors.replay_buffer).as_actor(
-            **cfg.replay_buffer, collate=collate
-        ),
-        ComputeAdvantages.options(**cfg.actors.compute_advantages).as_actor(),
-        ReferenceModel.options(**cfg.services.ref_model).as_service(**cfg.ref_model),
-        RewardActor.options(**cfg.services.reward_actor).as_service(
-            reward_functions=[MathReward(), ThinkingReward()]
-        ),
-    )
-
-    # Set max_steps to the configured value, or -1 if not specified or Null
-    max_steps = cfg.trainer.training.steps or -1
-
-    print("All services initialized successfully!")
-    shutdown_event = asyncio.Event()
-    # Here we spawn a torchstore storage volume per trainer process.
-    # We initialize after service initialization because torchstore currently
-    # requires access to the underlying proc meshes in the local rank strategy.
-    # We should be able to hide this in the future.
-    # TODO: support multiple host meshes
-    trainer_num_procs = cfg.actors.trainer["procs"]
-    trainer_host_mesh_name = cfg.actors.trainer["mesh_name"]
-    trainer_hosts = provisioner.get_host_mesh(trainer_host_mesh_name)
-    await ts.initialize(
-        mesh=trainer_hosts.spawn_procs(per_host={"procs": trainer_num_procs}),
-        strategy=ts.LocalRankStrategy(),
-    )
-    print("Torchstore successfully initialized with local rank strategy")
-
-    # ---- Core RL loops ---- #
-    async def continuous_rollouts():
-        rollout_count = 0
-        pad_id = await dataloader.pad_token.call_one()
-        while not shutdown_event.is_set():
-            t = Tracer("main_perf/continuous_rollouts")
-            t.start()
-            sample = await dataloader.sample.call_one()
-            if sample is None:
-                print("Dataloader is empty, exiting continuous rollout")
-                return
-
-            t.step("data_loading")
-
-            prompt, target = sample["request"], sample["target"]
-            responses: list[Completion] = await policy.generate.route(prompt)
-            t.step("policy_generation")
-
-            # Construct episodes and calculate rewards
-            episodes = []
-            input_ids = torch.ones(
-                (group_size, max_req_tokens + max_res_tokens),
-                dtype=torch.long,
-            )
-            for i, response in enumerate(responses):
-                episode = Episode(
-                    episode_id=str(uuid.uuid4()),
-                    pad_id=pad_id,
-                    request_len=max_req_tokens,
-                    response_len=max_res_tokens,
-                    target=target,
-                    completion=response,
-                )
-                episode.reward = await reward_actor.evaluate_response.route(
-                    prompt=prompt, response=response.text, target=target
-                )
-                episodes.append(episode)
-
-                # Build input_ids for reference logprobs
-                input_ids[i, :max_req_tokens] = episode.request_tensor
-                input_ids[i, max_req_tokens:] = episode.response_tensor
-
-            t.step("reward_evaluation")
-
-            ref_logprobs = await ref_model.forward.route(
-                input_ids, max_req_tokens, return_logprobs=True
-            )
-            t.step("reference_model_calculate_logprobs")
-
-            for i, episode in enumerate(episodes):
-                episode.ref_logprobs = ref_logprobs[i]
-            del ref_logprobs, input_ids
-
-            # Calculate advantages and add to replay buffer
-            advantages = await compute_advantages.compute.call_one(episodes)
-            for episode, advantage in zip(episodes, advantages):
-                episode.advantage = advantage
-                await replay_buffer.add.call_one(episode)
-
-            # Log metrics
-            rollout_count += 1
-            record_metric(
-                "main/continuous_rollouts/count_rollout_iterations", 1, Reduce.SUM
-            )
-            t.stop()
-
-    async def continuous_training():
-        training_step = 0
-        restart_tracer = True  # Flag to control when to restart tracer
-
-        while max_steps == -1 or training_step < max_steps:
-            # Restart tracer when needed (initial start or after completing a training step)
-            # Otherwise, we cannot measure time waiting for buffer
-            if restart_tracer:
-                t = Tracer("main_perf/continuous_training")
-                t.start()
-                restart_tracer = False
-
-            batch = await replay_buffer.sample.call_one(
-                curr_policy_version=training_step
-            )
-            if batch is None:
-                await asyncio.sleep(0.1)
-            else:
-                t.step("waiting_for_buffer")
-
-                inputs, targets = batch
-                await trainer.train_step.call(inputs, targets)
-                training_step += 1
-                t.step("train_step")
-
-                await trainer.push_weights.call(training_step)
-                t.step("push_weights")
-
-                await policy.update_weights.fanout(training_step)
-                t.step("update_weights")
-
-                if training_step >= 2:
-                    await drop_weights(training_step - 1)
-                    t.step("drop_weights")
-
-                t.stop()
-                restart_tracer = True
-
-                # Flush metrics every training step to WandB
-                await mlogger.flush.call_one(training_step)
-
-        print(
-            f"Reached training limit ({max_steps} steps). Exiting continuous_training loop."
-        )
-
-    num_rollout_threads = cfg.get("rollout_threads", 1)
-    num_training_threads = cfg.get("training_threads", 1)
-    print(
-        f"Starting GRPO with {num_rollout_threads} rollout threads, {num_training_threads} training threads"
-    )
-    rollout_tasks = [
-        asyncio.create_task(continuous_rollouts()) for _ in range(num_rollout_threads)
-    ]
-    training_task = asyncio.create_task(continuous_training())
+    rollout_tasks = None
+    training_task = None
 
     try:
+        (
+            dataloader,
+            policy,
+            trainer,
+            replay_buffer,
+            compute_advantages,
+            ref_model,
+            reward_actor,
+        ) = await asyncio.gather(
+            DatasetActor.options(**cfg.actors.dataset).as_actor(**cfg.dataset),
+            Policy.options(**cfg.services.policy).as_service(**cfg.policy),
+            RLTrainer.options(**cfg.actors.trainer).as_actor(
+                **cfg.trainer, loss=simple_grpo_loss
+            ),
+            ReplayBuffer.options(**cfg.actors.replay_buffer).as_actor(
+                **cfg.replay_buffer, collate=collate
+            ),
+            ComputeAdvantages.options(**cfg.actors.compute_advantages).as_actor(),
+            ReferenceModel.options(**cfg.services.ref_model).as_service(**cfg.ref_model),
+            RewardActor.options(**cfg.services.reward_actor).as_service(
+                reward_functions=[MathReward(), ThinkingReward()]
+            ),
+        )
+
+        # Set max_steps to the configured value, or -1 if not specified or Null
+        max_steps = cfg.trainer.training.steps or -1
+
+        print("All services initialized successfully!")
+        # Here we spawn a torchstore storage volume per trainer process.
+        # We initialize after service initialization because torchstore currently
+        # requires access to the underlying proc meshes in the local rank strategy.
+        # We should be able to hide this in the future.
+        # TODO: support multiple host meshes
+        trainer_num_procs = cfg.actors.trainer["procs"]
+        trainer_host_mesh_name = cfg.actors.trainer["mesh_name"]
+        trainer_hosts = provisioner.get_host_mesh(trainer_host_mesh_name)
+        await ts.initialize(
+            mesh=trainer_hosts.spawn_procs(per_host={"procs": trainer_num_procs}),
+            strategy=ts.LocalRankStrategy(),
+        )
+        print("Torchstore successfully initialized with local rank strategy")
+
+        # ---- Core RL loops ---- #
+        async def continuous_rollouts():
+            rollout_count = 0
+            pad_id = await dataloader.pad_token.call_one()
+            while not shutdown_event.is_set():
+                t = Tracer("main_perf/continuous_rollouts")
+                t.start()
+                sample = await dataloader.sample.call_one()
+                if sample is None:
+                    print("Dataloader is empty, exiting continuous rollout")
+                    return
+
+                t.step("data_loading")
+
+                prompt, target = sample["request"], sample["target"]
+                responses: list[Completion] = await policy.generate.route(prompt)
+                t.step("policy_generation")
+
+                # Construct episodes and calculate rewards
+                episodes = []
+                input_ids = torch.ones(
+                    (group_size, max_req_tokens + max_res_tokens),
+                    dtype=torch.long,
+                )
+                for i, response in enumerate(responses):
+                    episode = Episode(
+                        episode_id=str(uuid.uuid4()),
+                        pad_id=pad_id,
+                        request_len=max_req_tokens,
+                        response_len=max_res_tokens,
+                        target=target,
+                        completion=response,
+                    )
+                    episode.reward = await reward_actor.evaluate_response.route(
+                        prompt=prompt, response=response.text, target=target
+                    )
+                    episodes.append(episode)
+
+                    # Build input_ids for reference logprobs
+                    input_ids[i, :max_req_tokens] = episode.request_tensor
+                    input_ids[i, max_req_tokens:] = episode.response_tensor
+
+                t.step("reward_evaluation")
+
+                ref_logprobs = await ref_model.forward.route(
+                    input_ids, max_req_tokens, return_logprobs=True
+                )
+                t.step("reference_model_calculate_logprobs")
+
+                for i, episode in enumerate(episodes):
+                    episode.ref_logprobs = ref_logprobs[i]
+                del ref_logprobs, input_ids
+
+                # Calculate advantages and add to replay buffer
+                advantages = await compute_advantages.compute.call_one(episodes)
+                for episode, advantage in zip(episodes, advantages):
+                    episode.advantage = advantage
+                    await replay_buffer.add.call_one(episode)
+
+                # Log metrics
+                rollout_count += 1
+                record_metric(
+                    "main/continuous_rollouts/count_rollout_iterations", 1, Reduce.SUM
+                )
+                t.stop()
+
+        async def continuous_training():
+            training_step = 0
+            restart_tracer = True  # Flag to control when to restart tracer
+
+            while max_steps == -1 or training_step < max_steps:
+                # Restart tracer when needed (initial start or after completing a training step)
+                # Otherwise, we cannot measure time waiting for buffer
+                if restart_tracer:
+                    t = Tracer("main_perf/continuous_training")
+                    t.start()
+                    restart_tracer = False
+
+                batch = await replay_buffer.sample.call_one(
+                    curr_policy_version=training_step
+                )
+                if batch is None:
+                    await asyncio.sleep(0.1)
+                else:
+                    t.step("waiting_for_buffer")
+
+                    inputs, targets = batch
+                    await trainer.train_step.call(inputs, targets)
+                    training_step += 1
+                    t.step("train_step")
+
+                    await trainer.push_weights.call(training_step)
+                    t.step("push_weights")
+
+                    await policy.update_weights.fanout(training_step)
+                    t.step("update_weights")
+
+                    if training_step >= 2:
+                        await drop_weights(training_step - 1)
+                        t.step("drop_weights")
+
+                    t.stop()
+                    restart_tracer = True
+
+                    # Flush metrics every training step to WandB
+                    await mlogger.flush.call_one(training_step)
+
+            print(
+                f"Reached training limit ({max_steps} steps). Exiting continuous_training loop."
+            )
+
+        num_rollout_threads = cfg.get("rollout_threads", 1)
+        num_training_threads = cfg.get("training_threads", 1)
+        print(
+            f"Starting GRPO with {num_rollout_threads} rollout threads, {num_training_threads} training threads"
+        )
+        rollout_tasks = [
+            asyncio.create_task(continuous_rollouts()) for _ in range(num_rollout_threads)
+        ]
+        training_task = asyncio.create_task(continuous_training())
+
         await training_task
     except KeyboardInterrupt:
         print("Training interrupted by user")
@@ -482,19 +484,21 @@ async def main(cfg: DictConfig):
         print("Shutting down...")
         shutdown_event.set()
 
-        try:
-            # Give rollouts up to 5s to finish naturally
-            await asyncio.wait_for(
-                asyncio.gather(*rollout_tasks, return_exceptions=True),
-                timeout=5,
-            )
-        except asyncio.TimeoutError:
-            print("Timeout waiting for rollouts; forcing cancellation...")
-            for t in rollout_tasks:
-                t.cancel()
-            await asyncio.gather(*rollout_tasks, return_exceptions=True)
+        if rollout_tasks:
+            try:
+                # Give rollouts up to 5s to finish naturally
+                await asyncio.wait_for(
+                    asyncio.gather(*rollout_tasks, return_exceptions=True),
+                    timeout=5,
+                )
+            except asyncio.TimeoutError:
+                print("Timeout waiting for rollouts; forcing cancellation...")
+                for t in rollout_tasks:
+                    t.cancel()
+                await asyncio.gather(*rollout_tasks, return_exceptions=True)
 
-        training_task.cancel()
+        if training_task:
+            training_task.cancel()
 
         await shutdown()
 

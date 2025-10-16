@@ -401,7 +401,9 @@ class Provisioner:
         """Tears down all remaining remote allocations."""
         await self.shutdown_all_allocations()
         async with self._lock:
+            print("==DEBUG!!== Shutting down server")
             for server_name in self._server_names:
+                print(f"shutting down {server_name}")
                 commands.kill(server_name)
 
 
