@@ -4,27 +4,19 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# Usage: python -m tests.sandbox.rl_trainer.main --config apps/grpo/qwen3_32b.yaml
+# Usage: python -m tests.sandbox.rl_trainer.main --config apps/grpo/qwen3_1_7b.yaml
 
 import asyncio
 
 import torch
 import torchstore as ts
 from forge.actors.trainer import TitanTrainer
-from forge.controller.launcher import JOB_NAME_KEY, LAUNCHER_KEY
 from forge.controller.provisioner import init_provisioner, shutdown
 from forge.observability.metric_actors import get_or_create_metric_logger
 from forge.observability.perf_tracker import Tracer
-from forge.types import (
-    Launcher,
-    LauncherConfig,
-    ProcessConfig,
-    ProvisionerConfig,
-    ServiceConfig,
-)
+from forge.types import LauncherConfig, ProvisionerConfig
 from forge.util.config import parse
 from omegaconf import DictConfig
-from vllm.transformers_utils.tokenizer import get_tokenizer
 
 
 def simple_grpo_loss(
@@ -77,8 +69,8 @@ def generate_random_batch(
     dp_size: int = 1,
 ):
     """
-    Generate random input and target tensors matching GRPO data format
-    Creates one batch per data parallel rank
+    Generate random input and target tensors matching GRPO data format.
+    Creates one batch per data parallel rank.
     """
     inputs = []
     targets = []
@@ -126,7 +118,7 @@ async def main(cfg: DictConfig):
     """
     Trainer simulation app for memory/CPU profiling and system usage analysis.
 
-    This app initializes only the RLTrainer component and runs a training loop with
+    This app initializes only the TitanTrainer component and runs a training loop with
     synthetic random data to simulate real trainer system usage patterns. It is
     designed for:
 
@@ -149,42 +141,48 @@ async def main(cfg: DictConfig):
     response_len = cfg.get("max_res_tokens", 128)
     max_training_steps = cfg.trainer.training.get("steps", 100)
 
-    # Get vocab size from the actual model tokenizer
+    # Use hardcoded vocab size for testing (avoids network dependency)
     model_name = cfg.get("model")
-    print(f"Loading tokenizer for model: {model_name}")
-    tokenizer = get_tokenizer(model_name)
-    vocab_size = tokenizer.vocab_size
-    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-    print(f"Detected vocab size: {vocab_size}, pad token ID: {pad_id}")
+    print(f"Using model config: {model_name}")
+    # Common vocab sizes: Qwen=151936, Llama3=128256
+    vocab_size = 151936  # Qwen vocab size
+    pad_id = 0
+    print(f"Using vocab size: {vocab_size}, pad token ID: {pad_id}")
 
-    # Get data parallel size from replay buffer config (which matches trainer DP degree)
-    dp_size = cfg.get("replay_buffer", {}).get("dp_size", 1)
-    if dp_size is None:
-        # Fallback to trainer config if replay_buffer.dp_size not set
-        trainer_dp_degree = cfg.trainer.parallelism.get("data_parallel_shard_degree", 1)
-        dp_size = trainer_dp_degree if trainer_dp_degree != -1 else 1
+    # Get data parallel size from config
+    dp_size = cfg.trainer.parallelism.get("data_parallel_shard_degree", 1)
+    if dp_size == -1:
+        dp_size = 1
 
-    await init_provisioner(
-        ProvisionerConfig(
-            launcher_config=LauncherConfig(
-                launcher=cfg.get(LAUNCHER_KEY, Launcher.SLURM.value),
-                job_name=cfg.get(JOB_NAME_KEY, None),
-                services={k: ServiceConfig(**v) for k, v in cfg.services.items()},
-                actors={k: ProcessConfig(**v) for k, v in cfg.actors.items()},
-            )
+    # ---- Global setups ---- #
+    provisioner = None
+    if cfg.get("provisioner", None) is not None:
+        provisioner = await init_provisioner(
+            ProvisionerConfig(launcher_config=LauncherConfig(**cfg.provisioner))
         )
-    )
+    else:
+        provisioner = await init_provisioner()
 
-    metric_logging_cfg = cfg.get("metric_logging", {"console": {"log_per_rank": False}})
-    mlogger = await get_or_create_metric_logger()
+    metric_logging_cfg = cfg.get("metric_logging", {})
+    mlogger = await get_or_create_metric_logger(process_name="Controller")
     await mlogger.init_backends.call_one(metric_logging_cfg)
 
-    await ts.initialize(strategy=ts.ControllerStorageVolumes())
-    # Initialize trainer only
+    # Initialize trainer FIRST (this creates the mesh)
     print("Initializing trainer...")
     trainer = await TitanTrainer.options(**cfg.actors.trainer).as_actor(
         **cfg.trainer, loss=simple_grpo_loss
     )
+    print("Trainer initialized successfully!")
+
+    # NOW initialize torchstore (after trainer mesh is created)
+    trainer_num_procs = cfg.actors.trainer["procs"]
+    trainer_host_mesh_name = cfg.actors.trainer["mesh_name"]
+    trainer_hosts = provisioner.get_host_mesh(trainer_host_mesh_name)
+    await ts.initialize(
+        mesh=trainer_hosts.spawn_procs(per_host={"procs": trainer_num_procs}),
+        strategy=ts.LocalRankStrategy(),
+    )
+    print("Torchstore successfully initialized with local rank strategy")
     print("Trainer initialized successfully with following configs!")
     print(f"  - Local batch size: {local_batch_size}")
     print(f"  - Request length: {request_len}")
@@ -226,6 +224,8 @@ async def main(cfg: DictConfig):
 
             # Sleep between steps to avoid overwhelming the system
             await asyncio.sleep(1.0)
+
+        print(f"Reached training limit ({max_training_steps} steps). Exiting.")
 
     try:
         await continuous_training()

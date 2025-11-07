@@ -6,7 +6,6 @@
 
 import logging
 import os
-
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
@@ -15,10 +14,13 @@ from typing import Callable
 import torch
 import torch.distributed.checkpoint as dcp
 import torchstore as ts
-
 from monarch.actor import endpoint
 from torch import Tensor
 from torch.distributed.checkpoint._nested_dict import flatten_state_dict
+
+# Import directly from torchtitan
+from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.config.job_config import (
     ActivationCheckpoint,
     Checkpoint,
@@ -33,8 +35,9 @@ from torchtitan.config.job_config import (
     Quantize,
     Training,
 )
-from torchtitan.experiments.forge.engine import ForgeEngine
-from torchtitan.experiments.forge.job_config import ForgeJobConfig
+from torchtitan.distributed import ParallelDims, utils as dist_utils
+from torchtitan.protocols.train_spec import get_train_spec
+from torchtitan.tools import utils
 
 from forge.actors._torchstore_utils import (
     DcpHandle,
@@ -42,7 +45,6 @@ from forge.actors._torchstore_utils import (
     get_param_key,
     rdma_available,
 )
-
 from forge.controller import ForgeActor
 from forge.data.utils import batch_to_device
 from forge.observability.metrics import record_metric, Reduce
@@ -54,26 +56,30 @@ logger.setLevel(logging.DEBUG)
 
 @dataclass
 class TitanTrainer(ForgeActor):
-    """A generic trainer actor implementation built on top of TorchTitan.
+    """A generic trainer actor built directly on TorchTitan's composable APIs.
 
-    Built on top of TorchTitan's training engine, this actor provides a complete training
-    loop for reinforcement learning. It performs forward and backward passes with gradient
-    computation, optimization steps, and checkpoint management. Unlike the ReferenceModel
-    actor which only runs forward passes, RLTrainer actively updates the policy model
-    parameters through gradient descent.
+    This trainer uses TorchTitan's components directly instead of the ForgeEngine wrapper,
+    giving full control over the setup flow and making customization easy. It provides a
+    complete training loop for reinforcement learning with distributed training support.
 
-    The trainer supports the same distributed training strategies that TorchTitan does,
-    including but not limited to, tensor parallelism, data parallelism, and FSDP
-    (Fully Sharded Data Parallel). It is typically used in conjunction with ReferenceModel
-    for policy optimization algorithms like GRPO (Group Relative Policy Optimization),
-    where it optimizes the policy against a loss that includes KL divergence penalties
-    from the reference model.
+    Supports:
+    - Tensor parallelism (TP), FSDP, and data parallelism (DP)
+    - Activation checkpointing and torch.compile
+    - Automatic mixed precision (AMP)
+    - Checkpoint management with HuggingFace format export
+    - Weight export to TorchStore or local filesystem
 
-    The trainer handles:
-    - Forward and backward propagation with automatic mixed precision (AMP)
-    - Optimizer steps with learning rate scheduling
+    The trainer composes TorchTitan components in setup():
+    1. Initialize distributed training
+    2. Build model from train spec
+    3. Apply parallelism (TP, FSDP, activation checkpointing)
+    4. Initialize weights
+    5. Build optimizer and LR scheduler
+    6. Setup checkpointing
+    7. Setup training contexts (AMP, loss parallel)
     """
 
+    # TorchTitan config components
     job: Job = field(default_factory=Job)
     model: Model = field(default_factory=Model)
     optimizer: Optimizer = field(default_factory=Optimizer)
@@ -88,17 +94,20 @@ class TitanTrainer(ForgeActor):
     quantize: Quantize = field(default_factory=Quantize)
     comm: Comm = field(default_factory=Comm)
     memory_estimation: MemoryEstimation = field(default_factory=MemoryEstimation)
-    # Non JobConfig-related fields
+
+    # Forge-specific fields
     loss: Callable = lambda logits, **targets: logits
-    state_dict_key: str = "model_state_dict"
     use_dcp: bool = not rdma_available()
     dcp_path: str = "forge_dcp_tmp"
 
     def __post_init__(self):
         super().__init__()
+
+        # Set DCP options if needed
         if self.use_dcp:
             torch.serialization.set_crc32_options(False)
 
+        # Convert dict fields to proper types
         for f in fields(self):
             attr = getattr(self, f.name)
             if isinstance(attr, Mapping):
@@ -108,117 +117,344 @@ class TitanTrainer(ForgeActor):
                     f"{f.name} should be a {f.type} type or a dict like object"
                 )
 
-        self.step = 1  # fragile contract.
+        # Initialize runtime state
+        self.step = 1
         self.num_training_steps = self.training.steps
-        self.gradient_accumulation_steps = 1
+
+        # These will be set in setup()
+        self.device = None
+        self.parallel_dims = None
+        self.world_mesh = None
+        self.dp_degree = None
+        self.dp_rank = None
+        self.model_parts = None
+        self.optimizers = None
+        self.lr_schedulers = None
+        self.checkpointer = None
+        self.train_context = None
+        self.amp_context = None
+        self.gc_handler = None
+        self.model_args = None
+
+        # Compile loss function
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-        logger.info("Compiling loss")
+        logger.info("Compiling loss function")
         self.loss = torch.compile(self.loss)
 
     @endpoint
     async def setup(self):
-        # TODO: update ForgeEngine to not use ForgeJobConfig
-        engine_config = {f.name: getattr(self, f.name) for f in fields(self)}
-        for key in {
-            "loss",
-            "state_dict_key",
-            "use_dcp",
-            "dcp_path",
-        }:
-            engine_config.pop(key)  # Not part of job config
-        self.engine = ForgeEngine(ForgeJobConfig(**engine_config))
-        self.engine.checkpointer.load(step=self.step)
-        self.engine.optimizers.zero_grad()
+        """Setup trainer using TorchTitan's composable APIs.
+
+        This method orchestrates TorchTitan components to build the training
+        environment. The flow is explicit and customizable.
+        """
+
+        # ===== Phase 1: Distributed Setup =====
+
+        # Determine device
+        device_module = utils.device_module
+        device_type = utils.device_type
+        self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
+        device_module.set_device(self.device)
+
+        # Initialize distributed
+        dist_utils.init_distributed(
+            self.comm,
+            enable_cpu_backend=self.training.enable_cpu_offload,
+        )
+
+        # Build parallel dimensions
+        world_size = int(os.environ["WORLD_SIZE"])
+        self.parallel_dims = ParallelDims(
+            dp_shard=self.parallelism.data_parallel_shard_degree,
+            dp_replicate=self.parallelism.data_parallel_replicate_degree,
+            cp=self.parallelism.context_parallel_degree,
+            tp=self.parallelism.tensor_parallel_degree,
+            pp=self.parallelism.pipeline_parallel_degree,
+            ep=self.parallelism.expert_parallel_degree,
+            etp=self.parallelism.expert_tensor_parallel_degree,
+            world_size=world_size,
+        )
+        self.world_mesh = self.parallel_dims.world_mesh
+
+        # Extract DP info for data loading
+        if self.parallel_dims.dp_enabled:
+            dp_mesh = self.world_mesh["dp"]
+            self.dp_degree = dp_mesh.size()
+            self.dp_rank = dp_mesh.get_local_rank()
+        else:
+            self.dp_degree = 1
+            self.dp_rank = 0
+
+        # Setup determinism (using default seed and deterministic=False)
+        dist_utils.set_determinism(self.world_mesh, self.device)
+
+        # Setup garbage collection
+        self.gc_handler = utils.GarbageCollection(
+            gc_freq=self.training.gc_freq,
+            debug=self.training.gc_debug,
+        )
+
+        # ===== Phase 2: Model Building =====
+
+        # Get train spec from registry
+        train_spec = get_train_spec(self.model.name)
+
+        # Get model args for this flavor
+        self.model_args = train_spec.model_args[self.model.flavor]
+
+        # Update model args from config
+        self.model_args.update_from_config(self)
+
+        # Build model on meta device
+        with (
+            torch.device("meta"),
+            utils.set_default_dtype(TORCH_DTYPE_MAP[self.training.dtype]),
+        ):
+            model = train_spec.model_cls(self.model_args)
+
+        # Calculate model size
+        param_count, flops = self.model_args.get_nparams_and_flops(
+            model, self.training.seq_len
+        )
+        logger.info(f"Model has {param_count:,} parameters")
+        logger.info(f"Model FLOPs per token: {flops:,}")
+
+        # ===== Phase 3: Apply Parallelism =====
+
+        # Check for pipeline parallelism
+        if self.parallel_dims.pp_enabled:
+            raise NotImplementedError(
+                "Pipeline parallelism not yet supported. "
+                "Set parallelism.pipeline_parallel_degree=1"
+            )
+
+        # Apply TP, FSDP, activation checkpointing, compile
+        model = train_spec.parallelize_fn(model, self.parallel_dims, self)
+
+        # ===== Phase 4: Initialize Weights =====
+
+        # Determine init device
+        if self.training.enable_cpu_offload:
+            init_device = "cpu"
+            buffer_device = device_type
+        else:
+            init_device = device_type
+            buffer_device = None
+
+        # Move off meta device and initialize
+        model.to_empty(device=init_device)
+        with torch.no_grad():
+            model.init_weights(buffer_device=buffer_device)
+        model.train()
+
+        self.model_parts = [model]
+
+        # ===== Phase 5: Build Training Components =====
+
+        # Build optimizers
+        self.optimizers = train_spec.build_optimizers_fn(
+            self.model_parts,
+            self.optimizer,
+            self.parallel_dims,
+        )
+
+        # Build LR schedulers
+        self.lr_schedulers = train_spec.build_lr_schedulers_fn(
+            self.optimizers,
+            self.lr_scheduler,
+            self.training.steps,
+        )
+
+        # ===== Phase 6: Setup Checkpointing =====
+
+        self.checkpointer = CheckpointManager(
+            dataloader=None,  # No dataloader in RL training
+            model_parts=self.model_parts,
+            optimizers=self.optimizers,
+            lr_schedulers=self.lr_schedulers,
+            states={"train_state": self},
+            checkpoint_config=self.checkpoint,
+            sd_adapter=(
+                train_spec.state_dict_adapter(
+                    self.model_args,
+                    self.model.hf_assets_path,
+                )
+                if train_spec.state_dict_adapter
+                else None
+            ),
+        )
+
+        # Load checkpoint if exists
+        self.checkpointer.load(step=self.step)
+
+        # ===== Phase 7: Setup Training Contexts =====
+
+        # Loss parallel context
+        loss_parallel_enabled = (
+            self.parallel_dims.tp_enabled and not self.parallelism.disable_loss_parallel
+        )
+        enable_compiled_autograd = self.compile.enable
+        self.train_context = dist_utils.get_train_context(
+            loss_parallel_enabled, enable_compiled_autograd
+        )
+
+        # AMP context
+        self.amp_context = dist_utils.maybe_enable_amp(
+            self.parallel_dims,
+            self.training.mixed_precision_param,
+            device_type,
+        )
+
+        # ===== Phase 8: Initialize Gradient State =====
+
+        self.optimizers.zero_grad()
+
+        logger.info("TitanTrainer setup complete")
 
     def forward_backward(
         self, inputs: dict[str, Tensor], targets: dict[str, Tensor]
     ) -> Tensor:
-        model_parts = self.engine.model_parts
-        parallel_dims = self.engine.parallel_dims
-        optional_context_parallel_ctx = None
-        if parallel_dims.pp_enabled:
+        """Execute forward and backward pass.
+
+        Args:
+            inputs: Dictionary containing model inputs (e.g., input_ids)
+            targets: Dictionary containing targets for loss computation
+
+        Returns:
+            Loss tensor
+        """
+        assert len(self.model_parts) == 1, "Pipeline parallelism not supported"
+        model = self.model_parts[0]
+
+        if self.parallel_dims.pp_enabled:
             raise NotImplementedError("PP not implemented yet")
-        else:
-            with self.engine.train_context(optional_context_parallel_ctx):
-                assert len(model_parts) == 1
-                with self.engine.maybe_enable_amp:
-                    logits = model_parts[0](**inputs)
-                    loss = self.loss(logits, **targets)
-                del logits  # Free to before bwd to avoid peaking memory
-                loss.backward()
+
+        with self.train_context():
+            with self.amp_context:
+                # Forward pass
+                logits = model(**inputs)
+
+                # Compute loss
+                loss = self.loss(logits, **targets)
+
+            # Free logits before backward to avoid memory peak
+            del logits
+
+            # Backward pass (gradients accumulate)
+            loss.backward()
+
         return loss
 
     @endpoint
     async def train_step(
         self, inputs: list[dict[str, Tensor]], targets: list[dict[str, Tensor]]
     ) -> float:
+        """Execute one complete training step.
+
+        This method performs forward pass, backward pass, optimizer step,
+        and checkpointing in one call.
+
+        Args:
+            inputs: List of input dicts, one per DP rank
+            targets: List of target dicts, one per DP rank
+
+        Returns:
+            Loss value (float)
+        """
         t = Tracer("rl_trainer_perf/step", timer="gpu", track_memory=True)
         t.start()
 
-        self.engine.gc_handler.run(self.step)
-        local_inputs = inputs[self.engine.dp_rank]
-        local_targets = targets[self.engine.dp_rank]
-        batch_to_device(local_inputs, self.engine.device)
-        batch_to_device(local_targets, self.engine.device)
+        # Run GC if needed
+        self.gc_handler.run(self.step)
 
+        # Get data for this DP rank
+        local_inputs = inputs[self.dp_rank]
+        local_targets = targets[self.dp_rank]
+
+        # Move to device
+        batch_to_device(local_inputs, self.device)
+        batch_to_device(local_targets, self.device)
+
+        # Forward + backward
         loss = self.forward_backward(local_inputs, local_targets)
+
+        # All-reduce loss for logging
         torch.distributed.all_reduce(loss)
 
         t.step("forward_backward")
 
-        current_lr = self.engine.lr_schedulers.schedulers[0].get_last_lr()[0]
+        # Get current LR
+        current_lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
         record_metric("rl_trainer/learning_rate", current_lr, Reduce.MIN)
 
-        self.engine.optimizers.step()
-        self.engine.optimizers.zero_grad()
-        self.engine.lr_schedulers.step()
+        # Optimizer step
+        self.optimizers.step()
+        self.optimizers.zero_grad()
+        self.lr_schedulers.step()
+
         t.step("optimizer_step")
 
-        # TODO: delete item() to avoid cpu-gpu sync
+        # Extract loss value
         loss = loss.detach().item()
         record_metric("rl_trainer/avg_loss", loss, Reduce.MEAN)
 
-        # These are placeholder values until the loss function exposes these metrics
-        # record_metric("rl_trainer/step/avg_kl_divergence", 0.0, Reduce.MEAN)
-        # record_metric("rl_trainer/step/std_kl_divergence", 0.0, Reduce.STD)
-        # record_metric("rl_trainer/step/avg_policy_entropy", 0.0, Reduce.MEAN)
-
+        # Increment step
         self.step += 1
-        self.engine.checkpointer.save(
+
+        # Checkpoint
+        self.checkpointer.save(
             curr_step=self.step,
             last_step=self.step == self.num_training_steps,
         )
+
         t.step("save_checkpoint")
         t.stop()
+
         return loss
 
     @endpoint
     async def push_weights(self, policy_version: int) -> None:
-        """Push weights to torchstore in HF format."""
+        """Push weights to TorchStore in HuggingFace format.
+
+        Args:
+            policy_version: Version number for this policy checkpoint
+        """
         t = Tracer("rl_trainer_perf/push_weights", timer="gpu", track_memory=True)
         t.start()
         logger.info(f"Pushing weights for policy version {policy_version}")
 
         start_time = time.perf_counter()
-        if "model" not in self.engine.checkpointer.states:
+
+        # Get model state dict
+        if "model" not in self.checkpointer.states:
             raise RuntimeError("Model state not found in checkpointer state")
 
-        sd = self.engine.checkpointer.states["model"].state_dict()
+        sd = self.checkpointer.states["model"].state_dict()
         flattened_state_dict, _ = flatten_state_dict(sd)
         t.step("flatten_state_dict")
-        if self.engine.checkpointer.sd_adapter is None:
+
+        # Convert to HF format
+        if self.checkpointer.sd_adapter is None:
             raise RuntimeError(
-                "Trying to save checkpoint in HF safetensors format, but sd_adapter is not provided."
+                "Trying to save checkpoint in HF safetensors format, "
+                "but sd_adapter is not provided."
             )
-        hf_state_dict = self.engine.checkpointer.sd_adapter.to_hf(flattened_state_dict)
+
+        hf_state_dict = self.checkpointer.sd_adapter.to_hf(flattened_state_dict)
         t.step("to_hf")
+
+        # Save using DCP or direct TorchStore
         if self.use_dcp:
+            # Save via distributed checkpoint
             key = get_dcp_whole_state_dict_key(policy_version)
             dcp_id = f"{self.dcp_path}/{key}"
-            storage_writer = torch.distributed.checkpoint.FileSystemWriter(
+
+            storage_writer = dcp.FileSystemWriter(
                 dcp_id, single_file_per_rank=False, thread_count=8
             )
             metadata = dcp.save(storage_writer=storage_writer, state_dict=hf_state_dict)
+
             dcp_handle = DcpHandle(
                 checkpoint_id=dcp_id,
                 metadata=metadata,
@@ -227,15 +463,18 @@ class TitanTrainer(ForgeActor):
             await ts.put(key, dcp_handle)
             t.step("dcp_save")
         else:
+            # Save directly to TorchStore
             for name, param in hf_state_dict.items():
                 key = get_param_key(policy_version, name)
                 await ts.put(key, param)
             t.step("ts_save")
+
         t.stop()
         end_time = time.perf_counter()
         logger.info("Completed weights push in %.2f seconds", end_time - start_time)
 
     @endpoint
     async def cleanup(self) -> None:
-        if self.engine.checkpointer:
-            self.engine.checkpointer.close()
+        """Cleanup resources."""
+        if self.checkpointer:
+            self.checkpointer.close()
