@@ -33,7 +33,7 @@ from torchtitan.config.job_config import (
     Quantize,
     Training,
 )
-from torchtitan.experiments.forge.engine import ForgeEngine
+from torchtitan.experiments.forge import StepwiseTrainer
 from torchtitan.experiments.forge.job_config import ForgeJobConfig
 
 from forge.actors._torchstore_utils import (
@@ -56,10 +56,10 @@ logger.setLevel(logging.DEBUG)
 class TitanTrainer(ForgeActor):
     """A generic trainer actor implementation built on top of TorchTitan.
 
-    Built on top of TorchTitan's training engine, this actor provides a complete training
+    Built on top of TorchTitan's StepwiseTrainer, this actor provides a complete training
     loop for reinforcement learning. It performs forward and backward passes with gradient
     computation, optimization steps, and checkpoint management. Unlike the ReferenceModel
-    actor which only runs forward passes, RLTrainer actively updates the policy model
+    actor which only runs forward passes, TitanTrainer actively updates the policy model
     parameters through gradient descent.
 
     The trainer supports the same distributed training strategies that TorchTitan does,
@@ -117,7 +117,6 @@ class TitanTrainer(ForgeActor):
 
     @endpoint
     async def setup(self):
-        # TODO: update ForgeEngine to not use ForgeJobConfig
         engine_config = {f.name: getattr(self, f.name) for f in fields(self)}
         for key in {
             "loss",
@@ -126,69 +125,185 @@ class TitanTrainer(ForgeActor):
             "dcp_path",
         }:
             engine_config.pop(key)  # Not part of job config
-        self.engine = ForgeEngine(ForgeJobConfig(**engine_config))
-        self.engine.checkpointer.load(step=self.step)
-        self.engine.optimizers.zero_grad()
+        self.engine = StepwiseTrainer(
+            ForgeJobConfig(**engine_config), loss_fn=self.loss
+        )
+        self.engine.setup()
+        # StepwiseTrainer's setup() already loads checkpoint and zeros gradients
 
-    def forward_backward(
+    def _forward_backward(
         self, inputs: dict[str, Tensor], targets: dict[str, Tensor]
-    ) -> Tensor:
-        model_parts = self.engine.model_parts
-        parallel_dims = self.engine.parallel_dims
-        optional_context_parallel_ctx = None
-        if parallel_dims.pp_enabled:
-            raise NotImplementedError("PP not implemented yet")
-        else:
-            with self.engine.train_context(optional_context_parallel_ctx):
-                assert len(model_parts) == 1
-                with self.engine.maybe_enable_amp:
-                    logits = model_parts[0](**inputs)
-                    loss = self.loss(logits, **targets)
-                del logits  # Free to before bwd to avoid peaking memory
-                loss.backward()
-        return loss
+    ) -> float:
+        """Internal implementation: Execute forward and backward pass.
+
+        Args:
+            inputs: Global batch inputs - will be sliced per DP rank
+            targets: Global batch targets - will be sliced per DP rank
+
+        Returns:
+            Loss value (float)
+        """
+        self.engine.gc_handler.run(self.step)
+
+        # Slice global batch for this DP rank
+        rank = self.engine.dp_rank
+        dp_degree = self.engine.dp_degree
+        local_batch_size = self.training.local_batch_size
+
+        start_idx = rank * local_batch_size
+        end_idx = (rank + 1) * local_batch_size
+
+        # Slice inputs for this rank
+        local_inputs = {
+            k: v[start_idx:end_idx] if isinstance(v, Tensor) else v
+            for k, v in inputs.items()
+        }
+
+        # Slice targets for this rank
+        local_targets = {
+            k: v[start_idx:end_idx] if isinstance(v, Tensor) else v
+            for k, v in targets.items()
+        }
+
+        # Move to device
+        batch_to_device(local_inputs, self.engine.device)
+        batch_to_device(local_targets, self.engine.device)
+
+        # Forward + backward
+        loss = self.engine.forward_backward(local_inputs, local_targets)
+        torch.distributed.all_reduce(loss)
+
+        # Return loss as float
+        return loss.detach().item()
+
+    @endpoint
+    async def forward_backward(
+        self, inputs: dict[str, Tensor], targets: dict[str, Tensor]
+    ) -> float:
+        """Protocol: Execute forward and backward pass.
+
+        Args:
+            inputs: Global batch inputs - will be sliced per DP rank
+            targets: Global batch targets - will be sliced per DP rank
+
+        Returns:
+            Loss value (float)
+        """
+        return self._forward_backward(inputs, targets)
+
+    def _optim_step(self) -> dict:
+        """Internal implementation: Apply optimizer step.
+
+        Returns:
+            dict with keys: step, learning_rate, accumulated_microbatches
+        """
+        step_info = self.engine.optim_step()
+        self.step = step_info["step"]  # Sync step counter with StepwiseTrainer
+
+        # Save checkpoint
+        self.engine.checkpointer.save(
+            curr_step=self.step,
+            last_step=self.step == self.num_training_steps,
+        )
+
+        return step_info
+
+    @endpoint
+    async def optim_step(self) -> dict:
+        """Protocol: Apply optimizer step.
+
+        Returns:
+            dict with keys: step, learning_rate, accumulated_microbatches
+        """
+        return self._optim_step()
+
+    @endpoint
+    async def clear_gradients(self) -> None:
+        """Protocol: Clear accumulated gradients without applying them."""
+        self.engine.clear_gradients()
+
+    @endpoint
+    async def get_info(self) -> dict:
+        """Protocol: Get static trainer and model metadata.
+
+        Returns:
+            dict with keys:
+                - model_name: str
+                - step: int
+                - config: dict (model config)
+                - parallelism: dict (DP/TP/PP config)
+        """
+        return {
+            "model_name": f"{self.model.name}/{self.model.flavor}",
+            "step": self.step,
+            "config": {
+                "vocab_size": self.engine.model_args.vocab_size
+                if hasattr(self.engine.model_args, "vocab_size")
+                else None,
+                "hidden_size": self.engine.model_args.dim
+                if hasattr(self.engine.model_args, "dim")
+                else None,
+                "num_layers": self.engine.model_args.n_layers
+                if hasattr(self.engine.model_args, "n_layers")
+                else None,
+                "num_attention_heads": self.engine.model_args.n_heads
+                if hasattr(self.engine.model_args, "n_heads")
+                else None,
+                "max_seq_len": self.engine.model_args.max_seq_len
+                if hasattr(self.engine.model_args, "max_seq_len")
+                else None,
+            },
+            "parallelism": {
+                "dp_degree": self.engine.dp_degree,
+                "dp_rank": self.engine.dp_rank,
+                "tp_degree": self.engine.parallel_dims.tp
+                if hasattr(self.engine.parallel_dims, "tp")
+                else 1,
+                "pp_degree": self.engine.parallel_dims.pp
+                if hasattr(self.engine.parallel_dims, "pp")
+                else 1,
+                "device": str(self.engine.device),
+                "local_batch_size": self.training.local_batch_size,
+            },
+        }
+
+    @endpoint
+    async def get_status(self) -> dict:
+        """Protocol: Get current runtime status.
+
+        Returns:
+            dict with keys:
+                - step: int
+                - accumulated_microbatches: int
+        """
+        return {
+            "step": self.step,
+            "accumulated_microbatches": self.engine._accumulated_microbatches,
+        }
 
     @endpoint
     async def train_step(
         self, inputs: list[dict[str, Tensor]], targets: list[dict[str, Tensor]]
     ) -> float:
+        """Legacy method: Combined forward_backward + optim_step.
+
+        This method is kept for backward compatibility with GRPO.
+        New code should use forward_backward() and optim_step() separately.
+        """
         t = Tracer("rl_trainer_perf/step", timer="gpu", track_memory=True)
         t.start()
 
-        self.engine.gc_handler.run(self.step)
-        local_inputs = inputs[self.engine.dp_rank]
-        local_targets = targets[self.engine.dp_rank]
-        batch_to_device(local_inputs, self.engine.device)
-        batch_to_device(local_targets, self.engine.device)
-
-        loss = self.forward_backward(local_inputs, local_targets)
-        torch.distributed.all_reduce(loss)
-
+        # Use internal implementation (not endpoint)
+        loss = self._forward_backward(inputs, targets)
         t.step("forward_backward")
 
-        current_lr = self.engine.lr_schedulers.schedulers[0].get_last_lr()[0]
+        # Use internal implementation (not endpoint)
+        step_info = self._optim_step()
+        current_lr = step_info["learning_rate"]
         record_metric("rl_trainer/learning_rate", current_lr, Reduce.MIN)
-
-        self.engine.optimizers.step()
-        self.engine.optimizers.zero_grad()
-        self.engine.lr_schedulers.step()
-        t.step("optimizer_step")
-
-        # TODO: delete item() to avoid cpu-gpu sync
-        loss = loss.detach().item()
         record_metric("rl_trainer/avg_loss", loss, Reduce.MEAN)
 
-        # These are placeholder values until the loss function exposes these metrics
-        # record_metric("rl_trainer/step/avg_kl_divergence", 0.0, Reduce.MEAN)
-        # record_metric("rl_trainer/step/std_kl_divergence", 0.0, Reduce.STD)
-        # record_metric("rl_trainer/step/avg_policy_entropy", 0.0, Reduce.MEAN)
-
-        self.step += 1
-        self.engine.checkpointer.save(
-            curr_step=self.step,
-            last_step=self.step == self.num_training_steps,
-        )
-        t.step("save_checkpoint")
+        t.step("optimizer_step")
         t.stop()
         return loss
 
