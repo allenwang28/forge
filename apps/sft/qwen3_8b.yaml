@@ -14,7 +14,7 @@ model:
   hf_assets_path: hf://${model_name}
 
 processes:
-  procs: 8
+  procs: 4
   with_gpus: true
 
 optimizer:
