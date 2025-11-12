@@ -30,7 +30,7 @@ dataset:
 policy:
   engine_args:  # https://docs.vllm.ai/en/v0.10.0/api/vllm/engine/arg_utils.html#vllm.engine.arg_utils.EngineArgs
     model: ${model}
-    tensor_parallel_size: 2
+    tensor_parallel_size: 1
     pipeline_parallel_size: 1
     enforce_eager: false
   sampling_params:  # https://docs.vllm.ai/en/v0.10.0/api/vllm/sampling_params.html#vllm.sampling_params.SamplingParams
@@ -136,7 +136,7 @@ actors:
     with_gpus: false
     mesh_name: dataset
   trainer:
-    procs: 2
+    procs: 1
     with_gpus: true
     mesh_name: trainer
   replay_buffer:

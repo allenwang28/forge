@@ -99,6 +99,13 @@ MONARCH_MAX_FRAME_LENGTH = EnvVar(
     description="Sets the maximum frame length for Monarch's actor message delivery in bytes.",
 )
 
+MONARCH_ENABLE_UNAWAITED_PYTHON_TASK_TRACEBACK = EnvVar(
+    name="MONARCH_HYPERACTOR_ENABLE_UNAWAITED_PYTHON_TASK_TRACEBACK",
+    default=1,
+    description="Sets the maximum frame length for Monarch's actor message delivery in bytes.",
+)
+
+
 TORCHSTORE_USE_RDMA = EnvVar(
     name="TORCHSTORE_RDMA_ENABLED",
     default=1,

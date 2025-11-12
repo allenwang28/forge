@@ -199,25 +199,19 @@ class TitanTrainer(ForgeActor):
         t.start()
         logger.info(f"Pushing weights for policy version {policy_version}")
 
-        print("perf counter")
         start_time = time.perf_counter()
-        print("getting self engine checkpoointer states")
-        print(f"did it work? {self.engine.checkpointer.states}")
         if "model" not in self.engine.checkpointer.states:
             raise RuntimeError("Model state not found in checkpointer state")
 
-        print("trying to get the state dict")
         sd = self.engine.checkpointer.states["model"].state_dict()
         logger.info(f"Got state dict")
         flattened_state_dict, _ = flatten_state_dict(sd)
         t.step("flatten_state_dict")
-        print(f"flattened it")
         if self.engine.checkpointer.sd_adapter is None:
             raise RuntimeError(
                 "Trying to save checkpoint in HF safetensors format, but sd_adapter is not provided."
             )
         hf_state_dict = self.engine.checkpointer.sd_adapter.to_hf(flattened_state_dict)
-        print(f"got hf state dict")
         t.step("to_hf")
         if self.use_dcp:
             key = get_dcp_whole_state_dict_key(policy_version)
@@ -236,7 +230,6 @@ class TitanTrainer(ForgeActor):
         else:
             for name, param in hf_state_dict.items():
                 key = get_param_key(policy_version, name)
-                print(f"putting key {key}")
                 await ts.put(key, param)
             t.step("ts_save")
         t.stop()

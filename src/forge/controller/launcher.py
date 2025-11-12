@@ -21,6 +21,8 @@ import torchx.specs as specs
 from forge.types import Launcher, LauncherConfig
 from monarch._rust_bindings.monarch_hyperactor.alloc import AllocConstraints
 from monarch._rust_bindings.monarch_hyperactor.channel import ChannelTransport
+from monarch.tools.components import hyperactor
+
 
 from monarch._rust_bindings.monarch_hyperactor.config import configure
 from monarch._src.actor.allocator import RemoteAllocator, TorchXRemoteAllocInitializer
@@ -128,7 +130,7 @@ class Slurmlauncher(BaseLauncher):
         # HostMesh currently requires explicit configuration
         # of the underlying transport from client to mesh.
         # This can be removed in the future once this has been removed.
-        configure(default_transport=ChannelTransport.Tcp)
+        configure(default_transport=ChannelTransport.TcpWithHostname)
 
     async def get_allocator(self, name: str, num_hosts: int) -> tuple[Any, Any, str]:
         appdef = hyperactor.host_mesh(
@@ -137,9 +139,9 @@ class Slurmlauncher(BaseLauncher):
         for role in appdef.roles:
             # Note - this is hardcoded to SLURM
             # We got this with sinfo
-            role.resource.memMB = 2062607
+            role.resource.memMB = 1655502
             role.resource.cpu = 128
-            role.resource.gpu = 8
+            role.resource.gpu = 4
 
         # Note - we cannot add in an empty workspace, so we create a fake temporary one
         temp_workspace = tempfile.mkdtemp(prefix="forge_workspace_")

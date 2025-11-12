@@ -12,6 +12,9 @@ off_by_n: 1 # Off by one by default
 # Main loop configuration
 rollout_threads: 1   # Recommended to set equal to policy.num_replicas
 
+provisioner:
+  launcher: slurm
+
 
 # Observability configuration
 metric_logging:
@@ -139,6 +142,7 @@ actors:
     mesh_name: dataset
   trainer:
     procs: 1
+    hosts: 1
     with_gpus: true
     mesh_name: trainer
   replay_buffer:
