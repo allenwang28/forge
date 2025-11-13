@@ -142,7 +142,6 @@ actors:
     mesh_name: dataset
   trainer:
     procs: 1
-    hosts: 1
     with_gpus: true
     mesh_name: trainer
   replay_buffer:

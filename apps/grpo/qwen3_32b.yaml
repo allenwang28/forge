@@ -70,7 +70,7 @@ trainer:
   parallelism:
     data_parallel_replicate_degree: 1
     data_parallel_shard_degree: 1
-    tensor_parallel_degree: 8
+    tensor_parallel_degree: 4
     pipeline_parallel_degree: 1
     context_parallel_degree: 1
     expert_parallel_degree: 1
@@ -121,7 +121,7 @@ ref_model:
 services:
   policy:
     procs: ${policy.engine_args.tensor_parallel_size}
-    num_replicas: 4
+    num_replicas: 1
     hosts: 1
     with_gpus: true
     mesh_name: policy
@@ -142,7 +142,7 @@ actors:
     with_gpus: false
     mesh_name: dataset
   trainer:
-    procs: 8
+    procs: 4
     hosts: 1
     with_gpus: true
     mesh_name: trainer
