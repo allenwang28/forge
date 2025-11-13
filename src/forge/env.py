@@ -112,6 +112,13 @@ TORCHSTORE_USE_RDMA = EnvVar(
     description="Whether or not to use RDMA in TorchStore.",
 )
 
+NCCL_SOCKET_IFNAME = EnvVar(
+    name="NCCL_SOCKET_IFNAME",
+    default="eth0,eno1,enp0s31f6,enp50s0",
+    description="Whether or not to use RDMA in TorchStore.",
+)
+
+
 
 def all_env_vars() -> list[EnvVar]:
     """Retrieves all registered environment variable names."""
