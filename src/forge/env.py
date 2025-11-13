@@ -118,6 +118,12 @@ NCCL_SOCKET_IFNAME = EnvVar(
     description="Whether or not to use RDMA in TorchStore.",
 )
 
+NCCL_IB_HCA = EnvVar(
+    name="NCCL_IB_HCA",
+    default="mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_4:1",
+    description="IB interfaces.",
+)
+
 
 
 def all_env_vars() -> list[EnvVar]:
