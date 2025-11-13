@@ -118,6 +118,59 @@ NCCL_SOCKET_IFNAME = EnvVar(
     description="Whether or not to use RDMA in TorchStore.",
 )
 
+NCCL_IB_HCA = EnvVar(
+    name="NCCL_IB_HCA",
+    default="mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_4:1",
+    description="nccl infiniband hca?",
+)
+
+# NCCL_DEBUG = EnvVar(
+#     name="NCCL_DEBUG",
+#     default="DEBUG",
+#     description="nccl infiniband hca?",
+# )
+
+# NCCL_IB_DISABLE = EnvVar(
+#     name="NCCL_IB_DISABLE",
+#     default="1",
+#     description="nccl infiniband hca?",
+# )
+
+# NCCL_NET = EnvVar(
+#     name="NCCL_NET",
+#     default="Socket",
+#     description="nccl infiniband hca?",
+# )
+
+# NCCL_TIMEOUT = EnvVar(
+#     name="NCCL_TIMEOUT",
+#     default="3600",
+#     description="nccl infiniband hca?",
+# )
+
+# NCCL_BLOCKING_WAIT = EnvVar(
+#     name="NCCL_BLOCKING_WAIT",
+#     default="1",
+#     description="nccl infiniband hca?",
+# )
+
+# TORCH_NCCL_ENABLE_MONITORING = EnvVar(
+#     name="TORCH_NCCL_ENABLE_MONITORING",
+#     default="0",
+#     description="nccl infiniband hca?",
+# )
+
+# TORCH_NCCL_ENABLE_MONITORING = EnvVar(
+#     name="TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC",
+#     default="3600",
+#     description="nccl infiniband hca?",
+# )
+
+# TORCH_NCCL_ASYNC_ERROR_HANDLING = EnvVar(
+#     name="TORCH_NCCL_ASYNC_ERROR_HANDLING",
+#     default="1",
+#     description="nccl infiniband hca?",
+# )
 
 
 def all_env_vars() -> list[EnvVar]:
