@@ -98,7 +98,7 @@ async def main(cfg: DictConfig):
     print(f"Detected vocab size: {vocab_size}")
 
     trainer_dp_degree = cfg.trainer.parallelism.get("data_parallel_shard_degree", 1)
-    dp_size = trainer_dp_degree if trainer_dp_degree != -1 else 1
+    dp_size = trainer_dp_degree if trainer_dp_degree != -1 else cfg.actors.trainer.procs
 
     # ---- Global setups ---- #
     provisioner = None

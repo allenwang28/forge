@@ -124,6 +124,13 @@ NCCL_IB_HCA = EnvVar(
     description="nccl infiniband hca?",
 )
 
+VLLM_ATTENTION_BACKEND = EnvVar(
+    name="VLLM_ATTENTION_BACKEND",
+    default="TORCH_SDPA",
+    description="attention backend for vllm",
+)
+
+
 # NCCL_DEBUG = EnvVar(
 #     name="NCCL_DEBUG",
 #     default="DEBUG",

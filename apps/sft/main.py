@@ -40,6 +40,8 @@ from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.experiments.forge.engine import ForgeEngine
 from torchtitan.experiments.forge.job_config import ForgeJobConfig
+from forge.types import LauncherConfig, ProvisionerConfig
+from forge.controller.provisioner import init_provisioner, shutdown
 
 # from tqdm import tqdm
 
@@ -315,6 +317,16 @@ class ForgeSFTRecipe(ForgeActor, ForgeEngine):
 async def run(cfg: DictConfig) -> None:
 
     logging.info("Spawning recipe...")
+
+    provisioner = None
+    if cfg.get("provisioner", None) is not None:
+        provisioner = await init_provisioner(
+            ProvisionerConfig(launcher_config=LauncherConfig(**cfg.provisioner))
+        )
+    else:
+        provisioner = await init_provisioner()
+
+
     process_cfg = cfg.pop("processes")
 
     # Initialize metric logger in main process
