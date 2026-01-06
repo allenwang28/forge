@@ -8,6 +8,15 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, TypedDict, Union
 
+# Re-export job config types for convenience
+from forge.controller.job_backend import (
+    JobConfig,
+    JobScheduler,
+    MastJobConfig,
+    MeshSpec,
+    SlurmJobConfig,
+)
+
 
 class Message(TypedDict):
     role: str
@@ -124,6 +133,12 @@ class LauncherConfig:
 
 @dataclass
 class ProvisionerConfig:
-    """A config for the forge provisioner."""
+    """A config for the forge provisioner.
 
-    launcher_config: LauncherConfig
+    Args:
+        job_config: Configuration for Monarch Jobs API integration.
+            Uses the Jobs API (MASTJob, SlurmJob, LocalJob) for host provisioning.
+    """
+
+    job_config: JobConfig | None = None
+

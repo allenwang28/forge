@@ -15,12 +15,11 @@ import uuid
 
 import torch
 
-from forge.controller.launcher import BaseLauncher, get_launcher
+from forge.controller.job_backend import ForgeJobBackend
 from forge.env import all_env_vars, FORGE_DISABLE_METRICS
 from forge.types import ProcessConfig, ProvisionerConfig
 
 from monarch._src.actor.actor_mesh import ActorMesh
-from monarch._src.actor.shape import Extent
 
 from monarch.actor import (
     Actor,
@@ -31,7 +30,6 @@ from monarch.actor import (
     this_host,
 )
 
-from monarch.tools import commands
 from monarch.utils import setup_env_for_distributed
 
 logger = logging.getLogger(__name__)
@@ -194,11 +192,14 @@ class GpuManager:
 
 
 class Provisioner:
-    """A global resource provisioner."""
+    """A global resource provisioner.
+
+    The Provisioner manages resource allocation for Forge actors and services.
+    It uses Monarch's Jobs API (MASTJob, SlurmJob, LocalJob) for host provisioning.
+    """
 
     def __init__(self, cfg: ProvisionerConfig | None = None):
-        self._server_names = []
-        self._proc_server_map = {}
+        self._config = cfg
         self._lock = asyncio.Lock()
 
         # HostMeshes are currently not hashable, so
@@ -237,48 +238,71 @@ class Provisioner:
         }
         self._proc_host_map = {}
         self._host_mesh_map = {}
-        self.launcher: BaseLauncher | None = get_launcher(
-            cfg.launcher_config if cfg is not None else None
-        )
-        if not self.launcher:
-            logger.warning("Launcher not provided, remote allocations will not work.")
+
+        # Initialize job backend for remote allocations
+        self._job_backend: ForgeJobBackend | None = None
+        if cfg is not None and cfg.job_config is not None:
+            self._job_backend = ForgeJobBackend(cfg.job_config)
+            logger.info(
+                f"Job backend enabled with scheduler: {cfg.job_config.scheduler.value}"
+            )
+
+        # Counter for generating unique mesh names
+        self._mesh_counter = 0
 
         self._registered_actors: list["ForgeActor"] = []
         self._registered_services: list["ServiceInterface"] = []
 
     async def initialize(self):
-        """Call this after creating the instance"""
-        if self.launcher is not None:
-            await self.launcher.initialize()
+        """Initialize the provisioner and job backend.
 
-    async def create_host_mesh(self, name: str, num_hosts: int) -> HostMesh:
-        """Creates a remote server and a HostMesh on it."""
+        This should be called after creating the instance to configure
+        scheduler-specific settings like transport layer.
+        """
+        if self._job_backend is not None:
+            self._job_backend.initialize()
+
+    async def create_host_mesh(self, name: str, num_hosts: int) -> tuple[HostMesh, str]:
+        """Creates a HostMesh using Monarch's Jobs API.
+
+        Args:
+            name: Unique name for this host mesh
+            num_hosts: Number of hosts to allocate
+
+        Returns:
+            Tuple of (HostMesh, mesh_name)
+
+        Raises:
+            RuntimeError: If job_config is not configured
+        """
         # no need to lock here because this is already locked behind `get_proc_mesh`
-        if not self.launcher:
+
+        if self._job_backend is None:
             raise RuntimeError(
-                "You tried to create a remote allocation by specifying the number of hosts on an actor or service, "
-                "but no launcher was specified."
+                "You tried to create a remote allocation by specifying the number of hosts "
+                "on an actor or service, but no job_config was provided in ProvisionerConfig."
             )
-        logger.debug(f"Creating remote server for alloc {name}")
-        alloc, alloc_constraints, server_name = await self.launcher.get_allocator(
-            name, num_hosts
-        )
 
-        # We are asking Monarch to allocate a single process on
-        # every host, reflected in the Extent we provide below.
+        logger.debug(f"Creating host mesh '{name}' via Jobs API ({num_hosts} hosts)")
 
-        # Technically, this is ["hosts", "procs"] but to reduce
-        # confusion on its relationship with procs elsewhere,
-        # we call it "no_dim".
+        # If the job has already been applied with different meshes,
+        # we need to create a fresh backend for this allocation.
+        if self._job_backend.is_applied and not self._job_backend.has_mesh(name):
+            mesh_backend = ForgeJobBackend(self._config.job_config)
+            mesh_backend.request_mesh(name, num_hosts)
+            mesh_backend.apply()
+            host_mesh = mesh_backend.get_host_mesh(name)
+            # Store the backend for later cleanup
+            if not hasattr(self, "_additional_job_backends"):
+                self._additional_job_backends = []
+            self._additional_job_backends.append(mesh_backend)
+        else:
+            # First allocation or mesh already registered
+            self._job_backend.request_mesh(name, num_hosts)
+            self._job_backend.apply()
+            host_mesh = self._job_backend.get_host_mesh(name)
 
-        # TODO - remove this once Monarch supports HostMesh without it.
-        host_mesh = HostMesh.allocate_nonblocking(
-            name=name,
-            extent=Extent(["hosts", "no_dim"], [num_hosts, 1]),
-            allocator=alloc,
-            alloc_constraints=alloc_constraints,
-        )
-        return host_mesh, server_name
+        return host_mesh, name
 
     def get_host_mesh(self, name: str) -> HostMesh:
         """Returns the host mesh given its associated name.
@@ -327,13 +351,12 @@ class Provisioner:
         is_remote = num_hosts is not None and num_hosts > 0
 
         async with self._lock:
-            server_name = None
             if is_remote:
                 if mesh_name is None:
-                    created_hosts = len(self._server_names)
-                    mesh_name = f"alloc_{created_hosts}"
+                    mesh_name = f"alloc_{self._mesh_counter}"
+                    self._mesh_counter += 1
                 if host_mesh is None:
-                    host_mesh, server_name = await self.create_host_mesh(
+                    host_mesh, _ = await self.create_host_mesh(
                         name=mesh_name,
                         num_hosts=num_hosts,
                     )
@@ -379,6 +402,10 @@ class Provisioner:
             if env_vars:
                 await set_environment(procs, env_vars)
 
+            # Run scheduler-specific remote setup (e.g., MAST mounting)
+            if is_remote and self._job_backend is not None:
+                await self._job_backend.remote_setup(procs)
+
             # Set up PyTorch distributed environment if using GPUs
             if with_gpus:
                 await setup_env_for_distributed(
@@ -387,21 +414,12 @@ class Provisioner:
                     master_port=int(port),
                 )
 
-            if is_remote:
-                await self.launcher.remote_setup(procs)
-
             # Tag the proc mesh with additional metadata for our own cleanup later
             if with_gpus:
-                # Applies any launcher specific remote setup.
                 procs._gpu_ids = gpu_ids
 
             self._host_mesh_map[mesh_name] = host_mesh
             procs._host = host_mesh
-
-            # If we created a server, track so we can tear it down later.
-            if server_name:
-                self._server_names.append(server_name)
-                self._proc_server_map[procs] = server_name
 
             self._proc_host_map[procs] = host_mesh
 
@@ -442,9 +460,6 @@ class Provisioner:
                 gpu_manager = self._host_gpu_map[proc_mesh._host._host_id]
                 gpu_manager.release_gpus(proc_mesh._gpu_ids)
             await proc_mesh.stop()
-            if proc_mesh in self._proc_server_map:
-                server_name = self._proc_server_map[proc_mesh]
-                commands.kill(server_name)
             del self._proc_host_map[proc_mesh]
 
     def register_service(self, service: "ServiceInterface") -> None:
@@ -512,8 +527,15 @@ class Provisioner:
         """Tears down all remaining remote allocations."""
         await self.shutdown_all_allocations()
         async with self._lock:
-            for server_name in self._server_names:
-                commands.kill(server_name)
+            # Shutdown job backends
+            if self._job_backend is not None:
+                self._job_backend.shutdown()
+                self._job_backend = None
+
+            if hasattr(self, "_additional_job_backends"):
+                for backend in self._additional_job_backends:
+                    backend.shutdown()
+                self._additional_job_backends.clear()
 
 
 _provisioner: Provisioner | None = None

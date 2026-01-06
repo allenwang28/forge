@@ -7,7 +7,6 @@
 import logging
 
 import math
-import sys
 from typing import Any, Type, TYPE_CHECKING, TypeVar
 
 from monarch.actor import Actor, current_rank, current_size, endpoint
@@ -32,10 +31,6 @@ T = TypeVar("T", bound="ForgeActor")
 class ForgeActor(Actor):
     """
     Base class for Forge actors with configurable resource attributes.
-
-    The initialization sets up logging configuration with rank/size information and
-    initializes the actor's process mesh reference. The rank and size are automatically
-    determined from the current execution context.
 
     Args:
         *args: Variable length argument list passed to the parent Actor class.
@@ -68,20 +63,7 @@ class ForgeActor(Actor):
         if not hasattr(self, "_size"):
             self._size = math.prod(current_size().values())
 
-        # Custom formatter that includes rank/size info with blue prefix
-        BLUE = "\033[34m"
-        RESET = "\033[0m"
-        formatter = logging.Formatter(
-            f"{BLUE}[{self.__class__.__name__}-{self._rank}/{self._size}] %(asctime)s %(levelname)s{RESET} %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-        stdout_handler = logging.StreamHandler(sys.stdout)
-        stdout_handler.setLevel(logging.INFO)
-        stdout_handler.setFormatter(formatter)
-
         self._proc_mesh = None
-        self.logger.root.setLevel(logging.INFO)
-        self.logger.root.addHandler(stdout_handler)
         super().__init__(*args, **kwargs)
 
     @classmethod
